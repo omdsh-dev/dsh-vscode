@@ -29,10 +29,10 @@ function fixture() {
   return { document, requested, render, content: document.getElementById('tasksContent')! }
 }
 
-const external = { kind: 'external', id: 'remote', label: 'Remote build', depth: 0 }
+const external = { kind: 'external', id: 'remote', label: 'Remote build', depth: 0, readState: 'ready' }
 const local = { kind: 'local', id: 'local', label: 'Local check', depth: 0,
-  address: { kind: 'subagent', parentSessionId: 'root', childSessionId: 'local', mode: 'continuable' }, status: 'running', elapsedMs: 2100 }
-const snapshot = (tasks: unknown[]) => ({ sessionId: 'root', tasks, truncated: false })
+  address: { kind: 'subagent', parentSessionId: 'root', childSessionId: 'local', mode: 'continuable' }, status: 'running', elapsedMs: 2100, readState: 'ready' }
+const snapshot = (tasks: unknown[]) => ({ sessionId: 'root', tasks, truncated: false, readState: 'ready' })
 
 describe('Tasks panel capabilities', () => {
   it('renders external-only tasks as noninteractive rows without invented status or duration', () => {
@@ -59,5 +59,27 @@ describe('Tasks panel capabilities', () => {
     const h = fixture(); h.render(snapshot([{ ...external, label: '<img src=x onerror=alert(1)>', id: 'https://example.com' }]))
     expect(h.content.textContent).toContain('<img src=x onerror=alert(1)>')
     expect(h.content.querySelector('img, a')).toBeNull()
+  })
+  it('does not present missing or migrating roots as confirmed empty', () => {
+    const h = fixture()
+    h.render({ ...snapshot([]), readState: 'migration-required' })
+    expect(h.content.textContent).toContain('Only cached task information')
+    expect(h.content.textContent).not.toContain('No subagents')
+    h.render({ ...snapshot([]), readState: 'missing' })
+    expect(h.content.textContent).toContain('no longer available')
+    expect(h.content.textContent).not.toContain('No subagents')
+    h.render(snapshot([]))
+    expect(h.content.textContent).toContain('No subagents or background jobs')
+  })
+  it('labels cached local and external tasks as unverified without showing stale completion or duration', () => {
+    const h = fixture()
+    const cached = { ...local, readState: 'migration-required', status: 'unknown', elapsedMs: undefined }
+    h.render({ ...snapshot([cached, { ...external, readState: 'migration-required' }]), readState: 'migration-required' })
+    expect(h.content.textContent).toContain('Cached state, unverified')
+    expect(h.content.textContent).toContain('External · No local history · Cached, unverified')
+    expect(h.content.textContent).not.toMatch(/completed|0s recorded|NaN/)
+    h.content.querySelector<HTMLButtonElement>('button.task-row')!.click()
+    expect(h.requested).toEqual(['local'])
+    expect(h.content.textContent).toContain('Viewing child history here does not migrate')
   })
 })

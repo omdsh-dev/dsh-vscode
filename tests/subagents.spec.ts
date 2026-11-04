@@ -1,12 +1,13 @@
 import { EventEmitter } from 'node:events'
 import { describe, expect, it, vi } from 'vitest'
-import { subagentCatalog, subagentProgress, readSubagentTasks, subagentDetail } from '../src/subagents.js'
+import { subagentCatalog, subagentProgress, readSubagentTasks, subagentDetail, taskProjectionsOf } from '../src/subagents.js'
 import { inspectSubagents, readChildSnapshot } from '../src/dsh-subagents.js'
 import type { DshConnection } from '../src/dsh-connection.js'
 import type { HistoryEntry } from '../src/dsh-client.js'
 
 const child = (id: string) => ({ id, label: `Task ${id}`, mode: 'continuable' })
 const signal = () => new AbortController().signal
+const projection = (values: Record<string, unknown>) => ({ asOfSeq: 0, values })
 function toolEntries(id: string, input: string, output: string, failed = false, version = 'V4'): HistoryEntry[] {
   const content = [{ type: 'text', text: output }]
   return [
@@ -25,32 +26,32 @@ describe('read-only subagent tasks', () => {
   })
   it('retains external entries without fabricating a local address, status or progress', async () => {
     const external = { id: 'provider-execution', mode: 'external', label: 'Remote build' }
-    const read = vi.fn(async (id: string) => id === 'root' ? { subagentCatalog: [external, external, child('local')] } : {})
+    const read = vi.fn(async (id: string) => projection(id === 'root' ? { subagentCatalog: [external, external, child('local')] } : {}))
     const running = vi.fn(() => true)
     const result = await readSubagentTasks('root', read, running, signal())
-    expect(result.tasks[0]).toEqual({ kind: 'external', id: 'provider-execution', label: 'Remote build', depth: 0 })
+    expect(result.tasks[0]).toEqual({ kind: 'external', id: 'provider-execution', label: 'Remote build', depth: 0, readState: 'ready' })
     expect(result.tasks[1]).toMatchObject({ kind: 'local', id: 'local', status: 'running' })
     expect(read.mock.calls.flat()).toEqual(['root', 'local'])
     expect(running.mock.calls.flat()).toEqual(['local'])
   })
   it('counts external leaves toward the display limit without reading their IDs', async () => {
-    const read = vi.fn(async () => ({ subagentCatalog: Array.from({ length: 50 }, (_, id) => ({ id: String(id), mode: 'external' })) }))
+    const read = vi.fn(async () => projection({ subagentCatalog: Array.from({ length: 50 }, (_, id) => ({ id: String(id), mode: 'external' })) }))
     const result = await readSubagentTasks('root', read, () => false, signal())
     expect(result.tasks).toHaveLength(40); expect(result.truncated).toBe(true)
     expect(read).toHaveBeenCalledTimes(1)
   })
   it('keeps external tasks when a local child is missing or fails', async () => {
     const read = vi.fn(async (id: string) => {
-      if (id === 'root') return { subagentCatalog: [child('broken'), { id: 'remote', mode: 'external' }, child('missing')] }
+      if (id === 'root') return projection({ subagentCatalog: [child('broken'), { id: 'remote', mode: 'external' }, child('missing')] })
       if (id === 'broken') throw new Error('offline')
       return null
     })
     const result = await readSubagentTasks('root', read, () => false, signal())
     expect(result.tasks.map(task => task.id)).toEqual(['broken', 'remote', 'missing'])
-    expect(result.tasks[1]).toEqual({ kind: 'external', id: 'remote', label: 'Agent remote', depth: 0 })
+    expect(result.tasks[1]).toEqual({ kind: 'external', id: 'remote', label: 'Agent remote', depth: 0, readState: 'ready' })
   })
   it('rejects a forged external detail request in the host without a local read or stream', async () => {
-    const connection = { call: vi.fn(async () => ({ values: { subagentCatalog: [{ id: 'remote', mode: 'external' }] } })), openStreamSocket: vi.fn() }
+    const connection = { call: vi.fn(async () => projection({ subagentCatalog: [{ id: 'remote', mode: 'external' }] })), openStreamSocket: vi.fn() }
     await expect(inspectSubagents(connection as any, 'root', 'remote', () => false, signal())).rejects.toThrow('no local session history')
     expect(connection.call).toHaveBeenCalledTimes(1)
     expect(connection.openStreamSocket).not.toHaveBeenCalled()
@@ -70,7 +71,7 @@ describe('read-only subagent tasks', () => {
       nested: { subagentTiming: { lastTurnCompleted: true } },
       b: {},
     }
-    const read = vi.fn(async (id: string) => { if (id === 'broken') throw new Error('offline'); return values[id] ?? null })
+    const read = vi.fn(async (id: string) => { if (id === 'broken') throw new Error('offline'); return values[id] ? projection(values[id]) : null })
     const result = await readSubagentTasks('root', read, id => id === 'a', signal())
     expect(result.tasks.map(task => [task.address.parentSessionId, task.address.childSessionId, task.depth, task.status]))
       .toEqual([['root', 'a', 0, 'running'], ['a', 'nested', 1, 'completed'], ['root', 'missing', 0, 'unavailable'],
@@ -78,20 +79,20 @@ describe('read-only subagent tasks', () => {
     expect(read.mock.calls.flat()).toEqual(['root', 'a', 'nested', 'missing', 'broken', 'b'])
   })
   it('bounds large catalogs and deep trees', async () => {
-    const wide = await readSubagentTasks('root', async id => id === 'root'
-      ? { subagentCatalog: Array.from({ length: 60 }, (_, index) => child(String(index))) } : {}, () => false, signal())
+    const wide = await readSubagentTasks('root', async id => projection(id === 'root'
+      ? { subagentCatalog: Array.from({ length: 60 }, (_, index) => child(String(index))) } : {}), () => false, signal())
     expect(wide.tasks).toHaveLength(40); expect(wide.truncated).toBe(true)
-    const deep = await readSubagentTasks('0', async id => ({ subagentCatalog: [child(String(Number(id) + 1))] }), () => false, signal())
+    const deep = await readSubagentTasks('0', async id => projection({ subagentCatalog: [child(String(Number(id) + 1))] }), () => false, signal())
     expect(deep.tasks).toHaveLength(5); expect(deep.truncated).toBe(true)
   })
   it('stops discovery when closed rather than issuing further reads', async () => {
     const abort = new AbortController()
-    const read = vi.fn(async () => { abort.abort(); return { subagentCatalog: [child('a')] } })
+    const read = vi.fn(async () => { abort.abort(); return projection({ subagentCatalog: [child('a')] }) })
     await expect(readSubagentTasks('root', read, () => false, abort.signal)).rejects.toThrow()
     expect(read).toHaveBeenCalledTimes(1)
   })
   it('rejects detail requests outside the current parent tree before opening any stream', async () => {
-    const connection = { call: vi.fn(async () => ({ values: { subagentCatalog: [] } })), openStreamSocket: vi.fn() }
+    const connection = { call: vi.fn(async () => projection({ subagentCatalog: [] })), openStreamSocket: vi.fn() }
     await expect(inspectSubagents(connection as any, 'root', 'foreign', () => false, signal())).rejects.toThrow('task catalog')
     expect(connection.openStreamSocket).not.toHaveBeenCalled()
     expect(connection.call).toHaveBeenCalledWith('session/projections', { request: { sessionId: 'root' } }, 10_000, expect.any(AbortSignal))
@@ -154,6 +155,72 @@ describe('read-only subagent tasks', () => {
   })
 })
 
+describe('task projection provenance', () => {
+  it('accepts exact snapshots from both supported protocol generations', () => {
+    for (const value of [projection({}), { asOfSeq: -1, values: {} }, { kind: 'sequenced', asOfSeq: -1, values: {} }, { kind: 'sequenced', asOfSeq: 7, values: { title: 'Task' } }]) {
+      expect(taskProjectionsOf(value)).toEqual({ ...value, kind: 'sequenced' })
+    }
+    expect(taskProjectionsOf({ kind: 'migration-required', values: {} })).toEqual({ kind: 'migration-required', values: {} })
+    expect(taskProjectionsOf(null)).toBeNull()
+  })
+  it.each([undefined, {}, { values: {} }, { kind: 'unknown', asOfSeq: 0, values: {} },
+    { asOfSeq: -2, values: {} }, { asOfSeq: 0.5, values: {} }, { asOfSeq: Infinity, values: {} },
+    { asOfSeq: Number.MAX_SAFE_INTEGER + 1, values: {} }, { kind: 'sequenced', asOfSeq: 0, values: [] },
+    { kind: 'migration-required', values: null }])('rejects malformed or unknown snapshots', value => {
+    expect(() => taskProjectionsOf(value)).toThrow('Invalid DSH task projections')
+  })
+  it('does not infer task completion, timing or descendants from a migrating child', async () => {
+    const read = vi.fn(async (id: string) => id === 'root' ? projection({ subagentCatalog: [child('old'), child('current')] })
+      : id === 'old' ? { kind: 'migration-required', values: { subagentTiming: { lastTurnCompleted: true, settledMs: 9000 }, subagentCatalog: [child('descendant')] } }
+        : projection({ subagentTiming: { lastTurnCompleted: true, settledMs: 100 } }))
+    const running = vi.fn(() => false)
+    const result = await readSubagentTasks('root', read, running, signal())
+    expect(result.readState).toBe('ready')
+    expect(result.tasks[0]).toMatchObject({ id: 'old', readState: 'migration-required', status: 'unknown' })
+    expect(result.tasks[0]).not.toHaveProperty('elapsedMs')
+    expect(result.tasks[1]).toMatchObject({ id: 'current', readState: 'ready', status: 'completed', elapsedMs: 100 })
+    expect(read.mock.calls.flat()).toEqual(['root', 'old', 'current'])
+    expect(running.mock.calls.flat()).toEqual(['current'])
+  })
+  it('shows cached root membership without automatically reading any children', async () => {
+    const read = vi.fn(async () => ({ kind: 'migration-required', values: { subagentCatalog: [child('old'), { id: 'remote', mode: 'external' }] } }))
+    const running = vi.fn(() => true)
+    const result = await readSubagentTasks('root', read, running, signal())
+    expect(result.readState).toBe('migration-required')
+    expect(result.tasks.map(task => [task.id, task.readState])).toEqual([['old', 'migration-required'], ['remote', 'migration-required']])
+    expect(result.tasks[0]).toMatchObject({ status: 'unknown' })
+    expect(read).toHaveBeenCalledTimes(1); expect(running).not.toHaveBeenCalled()
+  })
+  it('keeps a cache miss, a confirmed empty catalog and a missing root distinct', async () => {
+    for (const [value, readState] of [
+      [{ kind: 'migration-required', values: {} }, 'migration-required'], [projection({}), 'ready'], [null, 'missing'],
+    ] as const) {
+      expect(await readSubagentTasks('root', async () => value, () => false, signal()))
+        .toEqual({ sessionId: 'root', readState, tasks: [], truncated: false })
+    }
+    await expect(readSubagentTasks('root', async () => { throw new Error('offline') }, () => false, signal())).rejects.toThrow('offline')
+  })
+  it('distinguishes missing children from failed reads without swallowing aborts', async () => {
+    const read = vi.fn(async (id: string) => {
+      if (id === 'root') return projection({ subagentCatalog: [child('missing'), child('failed')] })
+      if (id === 'missing') return null
+      throw new Error('offline')
+    })
+    const result = await readSubagentTasks('root', read, () => false, signal())
+    expect(result.tasks.map(task => task.readState)).toEqual(['missing', 'error'])
+    const abort = new AbortController()
+    await expect(readSubagentTasks('root', async id => {
+      if (id === 'root') return projection({ subagentCatalog: [child('cancelled'), child('unread')] })
+      abort.abort(); throw new Error('cancelled')
+    }, () => false, abort.signal)).rejects.toThrow()
+  })
+  it('does not issue any reads if the panel was already closed', async () => {
+    const read = vi.fn(), abort = new AbortController(); abort.abort()
+    await expect(readSubagentTasks('root', read, () => false, abort.signal)).rejects.toThrow()
+    expect(read).not.toHaveBeenCalled()
+  })
+})
+
 function streamHarness() {
   const sent: any[] = []
   const socket = Object.assign(new EventEmitter(), { readyState: 0, send: vi.fn((raw: string) => sent.push(JSON.parse(raw))), terminate: vi.fn() })
@@ -163,6 +230,20 @@ function streamHarness() {
 }
 const address = { kind: 'subagent', parentSessionId: 'root', childSessionId: 'a', mode: 'continuable' } as const
 describe('child history observation', () => {
+  it('allows explicit read-only history for a cached child without activating or publishing migration', async () => {
+    const h = streamHarness()
+    const call = vi.fn(async () => ({ kind: 'migration-required', values: { subagentCatalog: [child('a')] } }))
+    const result = inspectSubagents({ ...h.connection, call } as any, 'root', 'a', () => false, signal())
+    await vi.waitFor(() => expect(h.sent).toHaveLength(1))
+    expect(call).toHaveBeenCalledTimes(1)
+    expect(h.sent[0]).toMatchObject({ endpoint: 'session/follow', payload: { args: { request: { address } } } })
+    h.receive({ type: 'snapshot', header: { id: 'a' }, cursor: 0, hasMore: false, records: [] })
+    const inspection = await result
+    expect(inspection.readState).toBe('migration-required')
+    expect(inspection.tasks[0]).toMatchObject({ readState: 'migration-required', status: 'unknown' })
+    expect(inspection.detail?.childSessionId).toBe('a')
+    expect(h.socket.terminate).toHaveBeenCalledOnce()
+  })
   it('uses the non-activating subagent route and releases its own carrier after the snapshot', async () => {
     const h = streamHarness()
     const result = readChildSnapshot(h.connection, address, signal())

@@ -12,12 +12,13 @@ interface TaskIdentity {
   id: string
   label: string
   depth: number
+  readState: 'ready' | 'migration-required' | 'missing' | 'error'
 }
 export interface LocalSubagentTask extends TaskIdentity {
   kind: 'local'
   address: SubagentAddress
-  status: 'running' | 'completed' | 'interrupted' | 'inactive' | 'unavailable'
-  elapsedMs: number
+  status: 'running' | 'completed' | 'interrupted' | 'inactive' | 'unavailable' | 'unknown'
+  elapsedMs?: number
   error?: string
 }
 export interface ExternalSubagentTask extends TaskIdentity {
@@ -26,6 +27,7 @@ export interface ExternalSubagentTask extends TaskIdentity {
 export type SubagentTask = LocalSubagentTask | ExternalSubagentTask
 export interface TaskInspection {
   sessionId: string
+  readState: 'ready' | 'migration-required' | 'missing'
   tasks: SubagentTask[]
   truncated: boolean
   detail?: {
@@ -33,6 +35,22 @@ export interface TaskInspection {
     messages: { id: string; role: string; text: string; detail: string; failed: boolean; rawInput?: string; rawResult?: string }[]
     truncated: boolean
   }
+}
+
+export type TaskProjections =
+  | { kind: 'sequenced'; asOfSeq: number; values: Record<string, unknown> }
+  | { kind: 'migration-required'; values: Record<string, unknown> }
+
+/** Keep cache hints distinct from a verified snapshot, including on older runtimes. */
+export function taskProjectionsOf(value: unknown): TaskProjections | null {
+  if (value === null) return null
+  if (!wireRecord(value) || !wireRecord(value.values)) throw new Error('Invalid DSH task projections.')
+  if (value.kind === 'migration-required') return { kind: 'migration-required', values: value.values }
+  if ((value.kind === undefined || value.kind === 'sequenced')
+    && typeof value.asOfSeq === 'number' && Number.isSafeInteger(value.asOfSeq) && value.asOfSeq >= -1) {
+    return { kind: 'sequenced', asOfSeq: value.asOfSeq, values: value.values }
+  }
+  throw new Error('Invalid DSH task projections.')
 }
 
 /** Only parent-owned catalog entries establish a child relationship. */
@@ -59,16 +77,19 @@ export function subagentProgress(values: Record<string, unknown>, running?: bool
     : timing.lastTurnCompleted === false ? 'interrupted' : 'inactive' }
 }
 
-export async function readSubagentTasks(root: string, read: (id: string) => Promise<Record<string, unknown> | null>,
+export async function readSubagentTasks(root: string, read: (id: string) => Promise<unknown>,
   running: (id: string) => boolean | undefined, signal: AbortSignal): Promise<TaskInspection> {
-  const rootValues = await read(root)
   signal.throwIfAborted()
-  if (rootValues === null) throw new Error('This conversation is no longer available.')
-  const result: TaskInspection = { sessionId: root, tasks: [], truncated: false }
+  const rootValues = taskProjectionsOf(await read(root))
+  signal.throwIfAborted()
+  const result: TaskInspection = { sessionId: root, readState: rootValues === null ? 'missing'
+    : rootValues.kind === 'migration-required' ? 'migration-required' : 'ready', tasks: [], truncated: false }
+  if (rootValues === null) return result
   const seen = new Set([root])
   // Bounded discovery never resumes a child and never scans unrelated sessions.
-  const visit = async (parent: string, values: Record<string, unknown>, depth: number): Promise<void> => {
-    for (const child of subagentCatalog(values.subagentCatalog)) {
+  const visit = async (parent: string, projections: TaskProjections, depth: number): Promise<void> => {
+    const cached = projections.kind === 'migration-required'
+    for (const child of subagentCatalog(projections.values.subagentCatalog)) {
       signal.throwIfAborted()
       if (seen.has(child.id)) continue
       if (result.tasks.length >= 40 || depth > 4) { result.truncated = true; continue }
@@ -76,21 +97,29 @@ export async function readSubagentTasks(root: string, read: (id: string) => Prom
       if (child.mode === 'external') {
         // A provider's execution ID is not a local session address. The catalog
         // supplies no progress, transcript or interrupt capability for this row.
-        result.tasks.push({ kind: 'external', id: child.id, label: child.label, depth })
+        result.tasks.push({ kind: 'external', id: child.id, label: child.label, depth, readState: cached ? 'migration-required' : 'ready' })
         continue
       }
       const task: LocalSubagentTask = { kind: 'local', id: child.id, address: { kind: 'subagent', parentSessionId: parent, childSessionId: child.id, mode: child.mode },
-        label: child.label, depth, status: 'unavailable', elapsedMs: 0 }
+        label: child.label, depth, readState: cached ? 'migration-required' : 'error', status: cached ? 'unknown' : 'unavailable' }
       result.tasks.push(task)
-      let childValues: Record<string, unknown> | null
-      try { childValues = await read(child.id) } catch {
+      // Cached membership can be displayed, but polling must not hydrate or
+      // recursively expand it. Explicit detail reads use the read-only address.
+      if (cached) continue
+      let childValues: TaskProjections | null
+      try { childValues = taskProjectionsOf(await read(child.id)) } catch {
         signal.throwIfAborted()
         task.error = 'Could not read this agent. Refresh to retry.'
         continue
       }
       signal.throwIfAborted()
-      if (childValues === null) { task.error = 'Agent history is unavailable.'; continue }
-      Object.assign(task, subagentProgress(childValues, running(child.id)))
+      if (childValues === null) { task.readState = 'missing'; task.error = 'Agent history is no longer available.'; continue }
+      if (childValues.kind === 'migration-required') {
+        task.readState = 'migration-required'; task.status = 'unknown'
+        continue
+      }
+      task.readState = 'ready'
+      Object.assign(task, subagentProgress(childValues.values, running(child.id)))
       await visit(child.id, childValues, depth + 1)
     }
   }

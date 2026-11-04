@@ -2,6 +2,7 @@
 // node tests/dsh-runtime-smoke.mjs /absolute/path/to/@deepseek-ai/dsh/lib/bin.js
 // Add --tools to run deterministic tool/queue turns against a loopback model fixture.
 // Add --credentials (or --credentials-env) to verify fake keys in the isolated DSH_HOME.
+// Add --projection-fixtures on rc.5 to check external/migrating/missing tasks without mutating their logs.
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
@@ -12,6 +13,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { build } from 'esbuild'
+import { prepareTaskFixtures, verifyTaskFixtures } from './fixtures/dsh-task-projections.mjs'
 
 const cli = process.argv[2]
 const withTools = process.argv.includes('--tools')
@@ -21,6 +23,8 @@ const withCredentials = credentialEnv || process.argv.includes('--credentials')
 assert(!withSubagents || withTools, '--subagents requires --tools')
 assert(cli, 'Pass the absolute path to an installed DSH lib/bin.js; this test never installs or upgrades DSH.')
 const version = JSON.parse(await readFile(join(dirname(resolve(cli)), '../package.json'), 'utf8')).version
+const withProjectionFixtures = process.argv.includes('--projection-fixtures')
+assert(!withProjectionFixtures || version.startsWith('0.2.1-'), 'Projection fixtures target the released 0.2.1 wire/storage formats')
 const root = await mkdtemp(join(tmpdir(), 'dsh-sidebar-compat-'))
 const workspace = join(root, 'workspace')
 await mkdir(workspace)
@@ -80,6 +84,7 @@ if (withTools) {
 // DSH loads .env only from this fresh DSH_HOME and invoking workspace. Do not
 // inherit provider keys, user profile paths, proxy settings or DSH overrides.
 const env = { DSH_HOME: join(root, 'home'), DSH_CWD: workspace, DSH_TELEMETRY_DISABLED: '1', NO_COLOR: '1' }
+const taskFixture = withProjectionFixtures ? await prepareTaskFixtures(env.DSH_HOME, workspace) : undefined
 if (withTools) env.DSH_SMOKE_API_KEY = 'local-smoke-only'
 if (credentialEnv) env.DEEPSEEK_API_KEY = 'isolated-credential-fallback'
 for (const key of ['PATH', 'SystemRoot', 'WINDIR', 'TEMP', 'TMP', 'TMPDIR']) if (process.env[key]) env[key] = process.env[key]
@@ -117,13 +122,17 @@ try {
   }
   const waitFor = async predicate => {
     const deadline = Date.now() + 15_000
-    while (!predicate()) {
+    while (!await predicate()) {
       assert.equal(errors.length, 0, errors.map(e => e.message).join('\n'))
       if (Date.now() > deadline) throw new Error(`Timed out waiting for runtime state: ${redactDshSecrets(JSON.stringify(frames.slice(-8)))}\n${redactDshSecrets(diagnostics.slice(-4000))}`)
       await delay(25)
     }
   }
   await connect()
+  if (taskFixture) {
+    await verifyTaskFixtures(client, connection, taskFixture)
+    console.log(`PASS ${version}: external, empty, missing and migrating tasks; read-only history leaves legacy logs unchanged`)
+  }
   let credentialWritten = false
   if (withCredentials) {
     const initial = await client.credentials.describe()
@@ -198,8 +207,13 @@ try {
       releaseChild()
       await waitFor(() => frames.slice(before).some(frame => frame.type === 'session/event'
         && frame.sessionId === first.sessionId && frame.event.type === 'turn/end'))
-      const settled = await client.inspectTasks(first.sessionId, childId)
-      assert.equal(settled.tasks[0].status, 'completed')
+      // Newer runtimes may finish the parent before the child's lifecycle
+      // settles. Wait for the child itself, not the tool-call acknowledgement.
+      let settled
+      await waitFor(async () => {
+        settled = await client.inspectTasks(first.sessionId, childId)
+        return settled.tasks.find(task => task.id === childId)?.status === 'completed'
+      })
       assert(settled.detail.messages.some(message => message.text.includes('Child task verified.')))
       const childTools = settled.detail.messages.filter(message => message.role === 'tool')
       assert.equal(childTools.length, 2)
@@ -278,6 +292,9 @@ try {
   console.log(JSON.stringify({ version, result: 'passed', checks: ['auth', 'control', 'create/list', 'follow', 'models',
     'presets', 'plugins', 'settings', 'skills', 'commands', 'permissions', 'switch', 'reconnect', 'history', 'archive',
     ...(version.startsWith('0.2.') ? ['permission catalog', 'job streams'] : [])], isolatedDirectory: root }))
+} catch (error) {
+  console.error(redactDshSecrets(diagnostics.slice(-8000)))
+  throw error
 } finally {
   client?.dispose(); connection?.dispose()
   releaseFirst()

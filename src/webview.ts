@@ -1834,6 +1834,7 @@ export function chatHtml(webview: vscode.Webview, deepseekMarkUri: vscode.Uri, m
       if (tasksPanel.open) renderTasks();
     }
     function taskStatus(task) {
+      if (task.readState === 'migration-required') return 'Needs migration · Cached state, unverified';
       return ({ running: 'Running', completed: 'Turn completed', interrupted: 'Turn ended without completion', inactive: 'Inactive', unavailable: 'Unavailable' })[task.status] || 'Unknown';
     }
     function renderTasks() {
@@ -1845,6 +1846,8 @@ export function chatHtml(webview: vscode.Webview, deepseekMarkUri: vscode.Uri, m
       const openRecords = new Set([...tasksContent.querySelectorAll('details[open]')].map(item => item.dataset.recordId));
       const scroll = tasksContent.parentElement.scrollTop;
       tasksContent.replaceChildren(); tasksBack.classList.toggle('hidden', !taskChild);
+      if (taskSnapshot && taskSnapshot.readState === 'migration-required') tasksContent.append(node('p', 'inspector-warning', 'This conversation needs migration. Only cached task information is available; current task state and completeness are unverified. Viewing child history here does not migrate the stored session.'));
+      if (taskSnapshot && taskSnapshot.readState === 'missing') tasksContent.append(node('p', 'inspector-warning', 'This conversation is no longer available. Its task catalog could not be read.'));
       if (taskChild) {
         const task = taskSnapshot && taskSnapshot.tasks.find(item => item.id === taskChild);
         if (task && task.kind === 'local') tasksContent.append(node('h3', 'task-label', task.label), node('p', 'inspector-caption', taskStatus(task) + ' · ' + task.address.mode));
@@ -1874,11 +1877,11 @@ export function chatHtml(webview: vscode.Webview, deepseekMarkUri: vscode.Uri, m
           row.append(node('span', 'task-label', task.label));
           if (local) {
             row.type = 'button'; row.dataset.status = task.status;
-            const seconds = Math.floor(task.elapsedMs / 1000);
-            row.append(node('span', 'task-meta', taskStatus(task) + ' · ' + task.address.mode + ' · ' + seconds + 's recorded'));
+            const timing = task.readState === 'ready' && typeof task.elapsedMs === 'number' ? ' · ' + Math.floor(task.elapsedMs / 1000) + 's recorded' : '';
+            row.append(node('span', 'task-meta', taskStatus(task) + ' · ' + task.address.mode + timing));
             if (task.error) row.append(node('span', 'task-meta', task.error));
             row.addEventListener('click', () => { taskChild = task.id; taskSnapshot.detail = undefined; renderTasks(); tasksBack.focus(); requestTasks(); });
-          } else row.append(node('span', 'task-meta', 'External · No local history'));
+          } else row.append(node('span', 'task-meta', 'External · No local history' + (task.readState === 'migration-required' ? ' · Cached, unverified' : '')));
           tasksContent.append(row);
         }
         if (taskSnapshot && taskSnapshot.truncated) tasksContent.append(node('p', 'inspector-warning', 'Task tree display limit reached (40 agents / 5 levels).'));
@@ -1888,7 +1891,7 @@ export function chatHtml(webview: vscode.Webview, deepseekMarkUri: vscode.Uri, m
           const row = node('div', 'job-row'); const status = string(job.detail) || string(job.status);
           row.title = status; row.append(node('span', 'job-kind', string(job.kind, 'job')), node('span', 'job-label', string(job.label, 'Background job')), node('span', 'job-detail', status), node('span', 'job-duration', jobDuration(job))); tasksContent.append(row);
         }
-        if (taskSnapshot && !tasks.length && !jobs.length) tasksContent.append(node('p', 'inspector-caption', 'No subagents or background jobs in this conversation.'));
+        if (taskSnapshot && taskSnapshot.readState === 'ready' && !tasks.length && !jobs.length) tasksContent.append(node('p', 'inspector-caption', 'No subagents or background jobs in this conversation.'));
       }
       tasksContent.parentElement.scrollTop = scroll;
       if (focusedId) [...tasksContent.querySelectorAll('button')].find(button => button.dataset.taskId === focusedId)?.focus({ preventScroll: true });
