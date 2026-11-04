@@ -8,14 +8,22 @@ export interface SubagentAddress {
   childSessionId: string
   mode: 'one-shot' | 'continuable' | 'unknown'
 }
-export interface SubagentTask {
-  address: SubagentAddress
+interface TaskIdentity {
+  id: string
   label: string
   depth: number
+}
+export interface LocalSubagentTask extends TaskIdentity {
+  kind: 'local'
+  address: SubagentAddress
   status: 'running' | 'completed' | 'interrupted' | 'inactive' | 'unavailable'
   elapsedMs: number
   error?: string
 }
+export interface ExternalSubagentTask extends TaskIdentity {
+  kind: 'external'
+}
+export type SubagentTask = LocalSubagentTask | ExternalSubagentTask
 export interface TaskInspection {
   sessionId: string
   tasks: SubagentTask[]
@@ -28,19 +36,19 @@ export interface TaskInspection {
 }
 
 /** Only parent-owned catalog entries establish a child relationship. */
-export function subagentCatalog(value: unknown): { id: string; label: string; mode: SubagentAddress['mode'] }[] {
+export function subagentCatalog(value: unknown): { id: string; label: string; mode: SubagentAddress['mode'] | 'external' }[] {
   if (!Array.isArray(value)) return []
   const seen = new Set<string>()
   return value.flatMap(entry => {
     if (!wireRecord(entry) || typeof entry.id !== 'string' || !entry.id || seen.has(entry.id)
-      || !['one-shot', 'continuable', 'unknown'].includes(String(entry.mode))) return []
+      || !['one-shot', 'continuable', 'unknown', 'external'].includes(String(entry.mode))) return []
     seen.add(entry.id)
     return [{ id: entry.id, label: typeof entry.label === 'string' && entry.label.trim() ? entry.label.slice(0, 200) : `Agent ${entry.id.slice(0, 8)}`,
-      mode: entry.mode as SubagentAddress['mode'] }]
+      mode: entry.mode as SubagentAddress['mode'] | 'external' }]
   })
 }
 
-export function subagentProgress(values: Record<string, unknown>, running?: boolean): Pick<SubagentTask, 'status' | 'elapsedMs'> {
+export function subagentProgress(values: Record<string, unknown>, running?: boolean): Pick<LocalSubagentTask, 'status' | 'elapsedMs'> {
   const timing = wireRecord(values.subagentTiming) ? values.subagentTiming : {}
   const finite = (value: unknown) => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0
   const active = wireRecord(timing.active) ? timing.active : undefined
@@ -65,7 +73,13 @@ export async function readSubagentTasks(root: string, read: (id: string) => Prom
       if (seen.has(child.id)) continue
       if (result.tasks.length >= 40 || depth > 4) { result.truncated = true; continue }
       seen.add(child.id)
-      const task: SubagentTask = { address: { kind: 'subagent', parentSessionId: parent, childSessionId: child.id, mode: child.mode },
+      if (child.mode === 'external') {
+        // A provider's execution ID is not a local session address. The catalog
+        // supplies no progress, transcript or interrupt capability for this row.
+        result.tasks.push({ kind: 'external', id: child.id, label: child.label, depth })
+        continue
+      }
+      const task: LocalSubagentTask = { kind: 'local', id: child.id, address: { kind: 'subagent', parentSessionId: parent, childSessionId: child.id, mode: child.mode },
         label: child.label, depth, status: 'unavailable', elapsedMs: 0 }
       result.tasks.push(task)
       let childValues: Record<string, unknown> | null

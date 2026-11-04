@@ -14,8 +14,9 @@ export async function inspectSubagents(connection: DshConnection, sessionId: str
   }, running, signal)
   signal.throwIfAborted()
   if (childId !== undefined) {
-    const child = inspection.tasks.find(task => task.address.childSessionId === childId)
+    const child = inspection.tasks.find(task => task.id === childId)
     if (child === undefined) throw new Error('This agent is not in the current conversation’s task catalog.')
+    if (child.kind === 'external') throw new Error('This external task has no local session history.')
     inspection.detail = await readChildSnapshot(connection, child.address, signal)
   }
   return inspection

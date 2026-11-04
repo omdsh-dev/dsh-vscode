@@ -306,7 +306,7 @@ export function chatHtml(webview: vscode.Webview, deepseekMarkUri: vscode.Uri, m
     .inspector-source { margin: 5px 0; color: var(--vscode-descriptionForeground); font-size: 10px; line-height: 1.5; }
     .inspector-content { max-height: 260px; margin: 6px 0; padding: 10px; overflow: auto; border-radius: 4px; background: var(--vscode-editor-background); font-family: var(--vscode-editor-font-family); font-size: 11px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 2; }
     .task-row { display: block; width: 100%; padding: 10px 8px; border: 0; border-bottom: 1px solid var(--vscode-widget-border); text-align: left; color: var(--vscode-foreground); background: transparent; }
-    .task-row:hover { background: var(--vscode-list-hoverBackground); }
+    button.task-row:hover { background: var(--vscode-list-hoverBackground); }
     .task-label { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 600; }
     .task-meta { display: block; margin-top: 4px; color: var(--vscode-descriptionForeground); font-size: 10px; line-height: 1.5; }
     .task-row[data-status="running"] .task-meta { color: var(--vscode-progressBar-background); }
@@ -1846,8 +1846,8 @@ export function chatHtml(webview: vscode.Webview, deepseekMarkUri: vscode.Uri, m
       const scroll = tasksContent.parentElement.scrollTop;
       tasksContent.replaceChildren(); tasksBack.classList.toggle('hidden', !taskChild);
       if (taskChild) {
-        const task = taskSnapshot && taskSnapshot.tasks.find(item => item.address.childSessionId === taskChild);
-        if (task) tasksContent.append(node('h3', 'task-label', task.label), node('p', 'inspector-caption', taskStatus(task) + ' · ' + task.address.mode));
+        const task = taskSnapshot && taskSnapshot.tasks.find(item => item.id === taskChild);
+        if (task && task.kind === 'local') tasksContent.append(node('h3', 'task-label', task.label), node('p', 'inspector-caption', taskStatus(task) + ' · ' + task.address.mode));
         const detail = taskSnapshot && taskSnapshot.detail;
         if (detail && detail.childSessionId === taskChild) {
           tasksContent.append(node('p', 'inspector-caption', 'Recorded messages and tool results. In-progress text appears after it is recorded by DSH.'));
@@ -1868,12 +1868,17 @@ export function chatHtml(webview: vscode.Webview, deepseekMarkUri: vscode.Uri, m
         const tasks = taskSnapshot ? taskSnapshot.tasks : [];
         if (tasks.length) tasksContent.append(node('div', 'jobs-title', 'Subagents · ' + tasks.length));
         for (const task of tasks) {
-          const row = node('button', 'task-row'); row.type = 'button'; row.dataset.taskId = task.address.childSessionId; row.dataset.status = task.status;
+          const local = task.kind === 'local';
+          const row = node(local ? 'button' : 'div', 'task-row'); row.dataset.taskId = task.id;
           row.style.paddingLeft = (8 + task.depth * 10) + 'px';
-          const seconds = Math.floor(task.elapsedMs / 1000);
-          row.append(node('span', 'task-label', task.label), node('span', 'task-meta', taskStatus(task) + ' · ' + task.address.mode + ' · ' + seconds + 's recorded'));
-          if (task.error) row.append(node('span', 'task-meta', task.error));
-          row.addEventListener('click', () => { taskChild = task.address.childSessionId; taskSnapshot.detail = undefined; renderTasks(); tasksBack.focus(); requestTasks(); });
+          row.append(node('span', 'task-label', task.label));
+          if (local) {
+            row.type = 'button'; row.dataset.status = task.status;
+            const seconds = Math.floor(task.elapsedMs / 1000);
+            row.append(node('span', 'task-meta', taskStatus(task) + ' · ' + task.address.mode + ' · ' + seconds + 's recorded'));
+            if (task.error) row.append(node('span', 'task-meta', task.error));
+            row.addEventListener('click', () => { taskChild = task.id; taskSnapshot.detail = undefined; renderTasks(); tasksBack.focus(); requestTasks(); });
+          } else row.append(node('span', 'task-meta', 'External · No local history'));
           tasksContent.append(row);
         }
         if (taskSnapshot && taskSnapshot.truncated) tasksContent.append(node('p', 'inspector-warning', 'Task tree display limit reached (40 agents / 5 levels).'));

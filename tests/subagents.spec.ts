@@ -23,6 +23,38 @@ describe('read-only subagent tasks', () => {
       .toEqual([{ id: 'a', label: 'Task a', mode: 'continuable' }, { id: 'b', label: 'Agent b', mode: 'unknown' }])
     expect(subagentCatalog({ children: [child('a')] })).toEqual([])
   })
+  it('retains external entries without fabricating a local address, status or progress', async () => {
+    const external = { id: 'provider-execution', mode: 'external', label: 'Remote build' }
+    const read = vi.fn(async (id: string) => id === 'root' ? { subagentCatalog: [external, external, child('local')] } : {})
+    const running = vi.fn(() => true)
+    const result = await readSubagentTasks('root', read, running, signal())
+    expect(result.tasks[0]).toEqual({ kind: 'external', id: 'provider-execution', label: 'Remote build', depth: 0 })
+    expect(result.tasks[1]).toMatchObject({ kind: 'local', id: 'local', status: 'running' })
+    expect(read.mock.calls.flat()).toEqual(['root', 'local'])
+    expect(running.mock.calls.flat()).toEqual(['local'])
+  })
+  it('counts external leaves toward the display limit without reading their IDs', async () => {
+    const read = vi.fn(async () => ({ subagentCatalog: Array.from({ length: 50 }, (_, id) => ({ id: String(id), mode: 'external' })) }))
+    const result = await readSubagentTasks('root', read, () => false, signal())
+    expect(result.tasks).toHaveLength(40); expect(result.truncated).toBe(true)
+    expect(read).toHaveBeenCalledTimes(1)
+  })
+  it('keeps external tasks when a local child is missing or fails', async () => {
+    const read = vi.fn(async (id: string) => {
+      if (id === 'root') return { subagentCatalog: [child('broken'), { id: 'remote', mode: 'external' }, child('missing')] }
+      if (id === 'broken') throw new Error('offline')
+      return null
+    })
+    const result = await readSubagentTasks('root', read, () => false, signal())
+    expect(result.tasks.map(task => task.id)).toEqual(['broken', 'remote', 'missing'])
+    expect(result.tasks[1]).toEqual({ kind: 'external', id: 'remote', label: 'Agent remote', depth: 0 })
+  })
+  it('rejects a forged external detail request in the host without a local read or stream', async () => {
+    const connection = { call: vi.fn(async () => ({ values: { subagentCatalog: [{ id: 'remote', mode: 'external' }] } })), openStreamSocket: vi.fn() }
+    await expect(inspectSubagents(connection as any, 'root', 'remote', () => false, signal())).rejects.toThrow('no local session history')
+    expect(connection.call).toHaveBeenCalledTimes(1)
+    expect(connection.openStreamSocket).not.toHaveBeenCalled()
+  })
   it('never equates idle with success or an old open turn with live execution', () => {
     expect(subagentProgress({})).toEqual({ status: 'inactive', elapsedMs: 0 })
     expect(subagentProgress({ subagentTiming: { settledMs: 12, active: { since: 30, through: 40 } } }, false))
