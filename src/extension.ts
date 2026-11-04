@@ -297,6 +297,9 @@ export class DshChatController implements vscode.Disposable {
     return this.runtime.state.kind === 'ready' ? this.runtime.connection : undefined
   }
 
+  /** Bind configuration dialogs to one client; never replay secrets on a replacement. */
+  get runtimeCredentials() { return this.client?.credentials }
+
   publish(patch: Partial<ChatViewState>): void {
     this._state = { ...this._state, ...patch }
     this.changes.fire(this._state)

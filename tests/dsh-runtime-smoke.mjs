@@ -1,6 +1,7 @@
 // Opt-in real-runtime contract check (no external model requests or user credentials).
 // node tests/dsh-runtime-smoke.mjs /absolute/path/to/@deepseek-ai/dsh/lib/bin.js
 // Add --tools to run deterministic tool/queue turns against a loopback model fixture.
+// Add --credentials (or --credentials-env) to verify fake keys in the isolated DSH_HOME.
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
@@ -15,6 +16,8 @@ import { build } from 'esbuild'
 const cli = process.argv[2]
 const withTools = process.argv.includes('--tools')
 const withSubagents = process.argv.includes('--subagents')
+const credentialEnv = process.argv.includes('--credentials-env')
+const withCredentials = credentialEnv || process.argv.includes('--credentials')
 assert(!withSubagents || withTools, '--subagents requires --tools')
 assert(cli, 'Pass the absolute path to an installed DSH lib/bin.js; this test never installs or upgrades DSH.')
 const version = JSON.parse(await readFile(join(dirname(resolve(cli)), '../package.json'), 'utf8')).version
@@ -78,6 +81,7 @@ if (withTools) {
 // inherit provider keys, user profile paths, proxy settings or DSH overrides.
 const env = { DSH_HOME: join(root, 'home'), DSH_CWD: workspace, DSH_TELEMETRY_DISABLED: '1', NO_COLOR: '1' }
 if (withTools) env.DSH_SMOKE_API_KEY = 'local-smoke-only'
+if (credentialEnv) env.DEEPSEEK_API_KEY = 'isolated-credential-fallback'
 for (const key of ['PATH', 'SystemRoot', 'WINDIR', 'TEMP', 'TMP', 'TMPDIR']) if (process.env[key]) env[key] = process.env[key]
 const child = spawn(process.execPath, [resolve(cli), 'web', ...patchArgs, '--host', '127.0.0.1', '--port', '0', '--no-open'], {
   cwd: workspace, env, stdio: ['ignore', 'pipe', 'pipe'],
@@ -120,6 +124,22 @@ try {
     }
   }
   await connect()
+  let credentialWritten = false
+  if (withCredentials) {
+    const initial = await client.credentials.describe()
+    assert(initial, 'Expected the official credentials Remote')
+    assert.equal(initial.configured, credentialEnv)
+    if (initial.writable) {
+      await client.credentials.set('isolated-credential-A')
+      await client.credentials.set('isolated-credential-C')
+      assert.deepEqual(await client.credentials.describe(), { configured: true, writable: true, source: 'file' })
+      credentialWritten = true
+    } else {
+      assert(credentialEnv, 'Only the old inherited-env behavior should be read-only in this fixture')
+      assert.equal(initial.source, 'env')
+      console.log(`PASS ${version}: inherited credential is read-only; no store write attempted`)
+    }
+  }
   const first = await client.createSession(workspace)
   const second = await client.createSession(workspace)
   assert((await client.listSessions()).items.some(item => item.sessionId === first.sessionId))
@@ -241,6 +261,14 @@ try {
   const other = await client.openSession(second.sessionId); other.activate()
   client.dispose(); connection.dispose()
   await connect()
+  if (credentialWritten) {
+    assert.deepEqual(await client.credentials.describe(), { configured: true, writable: true, source: 'file' })
+    await client.credentials.unset()
+    const cleared = await client.credentials.describe()
+    assert.equal(cleared.configured, credentialEnv)
+    assert.equal(cleared.source, credentialEnv ? 'env' : undefined)
+    console.log(`PASS ${version}: credential set/replace, reconnect and explicit removal${credentialEnv ? ' with environment fallback restored' : ''}`)
+  }
   const restored = await client.openSession(first.sessionId); restored.activate()
   assert.equal(restored.projections.permissions.currentValue, 'workspace-write')
   await client.history(first.sessionId, 1)

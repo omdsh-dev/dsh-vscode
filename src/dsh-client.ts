@@ -1,5 +1,6 @@
 import { DshConnectionError, type DshConnection } from './dsh-connection.js'
 import { DshRemoteApi } from './dsh-remote-api.js'
+import { DshCredentials } from './dsh-credentials.js'
 import { DshSessionFeed, type SessionOpening } from './dsh-session-feed.js'
 import { wireRecord } from './dsh-streams.js'
 import type { DshEvent } from './conversation.js'
@@ -131,6 +132,7 @@ interface ModelCatalog {
 
 /** The sidebar uses only authenticated official Remotes. */
 export class DshClient {
+  readonly credentials = new DshCredentials((endpoint, args) => this.call(endpoint, args, 10_000))
   private readonly commandTransport = new DshCommandTransport((endpoint, args, timeoutMs) => this.call(endpoint, args, timeoutMs))
   private readonly api: DshRemoteApi
   private readonly feed: DshSessionFeed
