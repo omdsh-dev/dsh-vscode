@@ -102,19 +102,23 @@ export async function clearApiKey(
     const { target, credentials, check } = credentialTarget(controller)
     let destination: 'runtime' | 'legacy' = 'legacy'
     if (controller.runtimeOwnership === 'managed') {
-      if (credentials === undefined || controller.state.phase === 'loading') throw new Error('Wait for the DSH connection before clearing credentials.')
-      const description = await credentials.describe()
-      if (!await check()) return
-      if (description !== undefined) {
-        const choice = await vscode.window.showQuickPick([
-          ...(description.writable ? [{ label: 'DSH saved key', description: 'Shared runtime credential; environment fallbacks are kept', destination: 'runtime' as const }] : []),
-          { label: 'VS Code fallback key', description: 'Only this extension’s SecretStorage entry; DSH credentials are kept', destination: 'legacy' as const },
-        ], { title: 'Clear DeepSeek API Key', placeHolder: 'Choose which stored key to remove' })
-        if (choice === undefined || !await check()) return
-        destination = choice.destination
-      }
+      // Choosing local deletion must not depend on a credential RPC succeeding
+      // (or even on there being a client). Probe only after choosing DSH storage.
+      const connected = credentials !== undefined && controller.state.phase !== 'loading'
+      const choice = await vscode.window.showQuickPick([
+        ...(connected ? [{ label: 'DSH saved key', description: 'Shared runtime credential; environment fallbacks are kept', destination: 'runtime' as const }] : []),
+        { label: 'VS Code fallback key', description: 'Only this extension’s SecretStorage entry; DSH credentials are kept', destination: 'legacy' as const },
+      ], { title: 'Clear DeepSeek API Key', placeHolder: connected
+        ? 'Choose which stored key to remove' : 'DSH is not connected; only the VS Code fallback can be removed' })
+      if (choice === undefined || controller.isDisposed) return
+      destination = choice.destination
     }
     if (destination === 'runtime' && credentials !== undefined) {
+      if (!await check()) return
+      const description = await credentials.describe()
+      if (!await check()) return
+      if (description === undefined) throw new Error('This DSH runtime has no credential configuration API. To remove only the local fallback, choose “VS Code fallback key”.')
+      if (!description.writable) throw new Error('This DSH credential provider is read-only. To remove only the local fallback, choose “VS Code fallback key”.')
       const choice = await vscode.window.showWarningMessage(
         'Remove the DeepSeek key saved in DSH’s shared credential store? Other clients using the same DSH home are affected. Environment and VS Code fallback keys are not removed, and the key is not revoked at DeepSeek.',
         { modal: true }, 'Remove from DSH',
@@ -136,7 +140,9 @@ export async function clearApiKey(
     const choice = await vscode.window.showWarningMessage(
       'Remove only the DeepSeek environment fallback stored by this extension? DSH’s own saved key and other environment credentials will not be changed.', { modal: true }, 'Remove',
     )
-    if (choice !== 'Remove' || !await check()) return
+    // SecretStorage is extension-owned, not bound to a particular connection.
+    // A disconnect must not block removal; only a later restart is target-bound.
+    if (choice !== 'Remove' || controller.isDisposed) return
     try { await secrets.delete(DEEPSEEK_API_KEY_SECRET) }
     catch { throw new Error('Could not remove the VS Code fallback key.') }
     output.appendLine('[credentials] DeepSeek environment fallback removed from VS Code SecretStorage.')
@@ -147,6 +153,10 @@ export async function clearApiKey(
     }
     if (target.identity === undefined && isCurrentRuntimeTarget(controller, target)) {
       await vscode.window.showInformationMessage('VS Code fallback key removed. DSH credentials were not changed.')
+      return
+    }
+    if (controller.runtimeOwnership === 'managed' && (credentials === undefined || credentials !== controller.runtimeCredentials)) {
+      await vscode.window.showWarningMessage('VS Code fallback key removed. The runtime connection is unavailable or changed; no runtime was restarted. DSH credentials were not changed. Restart the intended runtime when ready to apply the change.')
       return
     }
     await restartAfterRuntimeChange(controller, target, 'VS Code fallback key removed; DSH credentials were not changed')

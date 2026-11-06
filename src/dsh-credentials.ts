@@ -36,7 +36,9 @@ export class DshCredentials implements RuntimeCredentials {
     let value: unknown
     try { value = await this.call('credentials/describe', { refs: [ref] }) }
     catch (error) {
-      if (error instanceof DshConnectionError && error.code === 'gateway/lookup-not-found') return undefined
+      // The official HTTP gateway leaves unregistered Remotes unclaimed (404).
+      // lookup-not-found is an argument lookup failure inside an existing Remote.
+      if (error instanceof DshConnectionError && error.code === 'http-error' && error.status === 404) return undefined
       throw failure(error, false)
     }
     const info = wireRecord(value) ? value[ref] : undefined

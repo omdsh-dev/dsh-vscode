@@ -17,11 +17,15 @@ describe('DSH credential Remote', () => {
     const credentials = new DshCredentials(async () => ({ DEEPSEEK_API_KEY: { configured: true, writable: true, source: 'secret-text' } }))
     expect(await credentials.describe()).toEqual({ configured: true, writable: true, source: 'runtime' })
   })
-  it('only falls back when the official Remote lookup is absent', async () => {
-    const call = vi.fn().mockRejectedValue(new DshConnectionError('gateway/lookup-not-found', 'absent'))
-    expect(await new DshCredentials(call).describe()).toBeUndefined()
+  it('falls back only on an HTTP 404 from the describe endpoint, never from a write', async () => {
+    const call = vi.fn().mockRejectedValue(new DshConnectionError('http-error', 'absent', 404))
+    const credentials = new DshCredentials(call)
+    expect(await credentials.describe()).toBeUndefined()
+    expect(call).toHaveBeenCalledExactlyOnceWith('credentials/describe', { refs: ['DEEPSEEK_API_KEY'] })
+    await expect(credentials.set('sk-test')).rejects.toThrow('could not be confirmed')
+    await expect(credentials.unset()).rejects.toThrow('could not be confirmed')
   })
-  it.each(['authentication-required', 'http-error', 'transport-error', 'gateway/internal', 'credential/rejected', 'invalid-response'])(
+  it.each(['authentication-required', 'transport-error', 'gateway/internal', 'gateway/lookup-not-found', 'gateway/definition-unavailable', 'credential/rejected', 'invalid-response'])(
     'does not treat %s as an old runtime or leak provider messages', async code => {
       const call = vi.fn().mockRejectedValue(new DshConnectionError(code, 'echoes secret-text', 404))
       const credentials = new DshCredentials(call)
@@ -32,6 +36,10 @@ describe('DSH credential Remote', () => {
       expect(call).toHaveBeenCalledTimes(3)
     },
   )
+  it.each([undefined, 401, 403, 405, 429, 500, 503])('does not treat HTTP %s as an absent Remote', async status => {
+    const credentials = new DshCredentials(vi.fn().mockRejectedValue(new DshConnectionError('http-error', 'secret-text', status)))
+    await expect(credentials.describe()).rejects.toThrow('Could not read DSH credential configuration')
+  })
   it.each([null, {}, { configured: true }, { configured: 'yes', writable: true }, { configured: true, writable: true, source: 1 }])(
     'rejects malformed status without echoing its body', async info => {
       const credentials = new DshCredentials(async () => ({ DEEPSEEK_API_KEY: info, value: 'secret-text' }))
