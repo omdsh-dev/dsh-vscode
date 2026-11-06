@@ -6,6 +6,7 @@ import { WebSocketServer } from 'ws'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { DshConnection, dshLocalUrl } from '../src/dsh-connection.ts'
 import { DshRemoteApi } from '../src/dsh-remote-api.ts'
+import { DshCredentials } from '../src/dsh-credentials.ts'
 
 const servers: Server[] = []
 const connections: DshConnection[] = []
@@ -277,6 +278,43 @@ describe('DSH authenticated Remote connection', () => {
     await expect(connection.call('session/prompt', {})).rejects.toMatchObject({
       code: 'session/model-unavailable', message: 'Rejected [redacted] and [redacted]',
     })
+  })
+
+  it.each([
+    { label: 'missing endpoint', status: 404, code: undefined, absent: true },
+    { label: 'unauthorized', status: 401, code: undefined, absent: false },
+    { label: 'forbidden', status: 403, code: undefined, absent: false },
+    { label: 'server failure', status: 500, code: undefined, absent: false },
+    { label: 'argument lookup failure', status: 200, code: 'gateway/lookup-not-found', absent: false },
+    { label: 'withdrawn definition', status: 200, code: 'gateway/definition-unavailable', absent: false },
+    { label: 'provider failure', status: 200, code: 'gateway/internal', absent: false },
+  ])('classifies credential $label through the real HTTP transport', async ({ status, code, absent }) => {
+    const requests: unknown[] = []
+    const url = await serve((request, response) => {
+      if (request.method === 'GET') {
+        response.writeHead(303, { location: '/', 'set-cookie': cookieFor(request.headers.host!) })
+        response.end(); return
+      }
+      let body = ''
+      request.on('data', chunk => { body += chunk })
+      request.on('end', () => {
+        const message = JSON.parse(body)
+        requests.push({ path: request.url, cookie: request.headers.cookie, args: message.payload.args })
+        response.writeHead(status, { 'content-type': status === 200 ? 'application/json' : 'text/plain' })
+        response.end(status === 200 ? JSON.stringify({ type: 'server-response', rpcId: message.rpcId,
+          result: { ok: false, error: { code, message: 'private-provider-text' } } }) : 'private-response-text')
+      })
+    })
+    const connection = connect(url)
+    await connection.authenticate(launchUrl(url))
+    const credentials = new DshCredentials((endpoint, args) => connection.call(endpoint, args))
+    const result = await credentials.describe().catch(error => error)
+    if (absent) expect(result).toBeUndefined()
+    else {
+      expect(result).toBeInstanceOf(Error)
+      expect(result.message).not.toMatch(/private-provider-text|private-response-text/)
+    }
+    expect(requests).toEqual([{ path: '/api/credentials/describe', cookie: cookieFor(url.host), args: { refs: ['DEEPSEEK_API_KEY'] } }])
   })
 
   it('does not replay a POST when its response is lost', async () => {

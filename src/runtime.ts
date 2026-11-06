@@ -245,7 +245,7 @@ export class DshRuntime implements vscode.Disposable {
     this.output.appendLine(`[runtime] cwd: ${workspace.fsPath}`)
     if (version !== undefined) this.output.appendLine(`[runtime] DSH version: ${redactDshSecrets(version)}`)
     this.output.appendLine(`[runtime] launch: ${redactDshSecrets(renderedCommand)}`)
-    if (storedApiKey !== undefined) this.output.appendLine('[runtime] DeepSeek credential: VS Code SecretStorage')
+    if (storedApiKey !== undefined) this.output.appendLine('[runtime] DeepSeek environment fallback: VS Code SecretStorage (DSH stored credentials may take precedence).')
     this.publish({
       kind: 'starting',
       detail: launch.sourceCheckout ? 'Starting the official DSH source profile…' : 'Starting the official DSH profile…',

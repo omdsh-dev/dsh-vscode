@@ -306,7 +306,7 @@ export function chatHtml(webview: vscode.Webview, deepseekMarkUri: vscode.Uri, m
     .inspector-source { margin: 5px 0; color: var(--vscode-descriptionForeground); font-size: 10px; line-height: 1.5; }
     .inspector-content { max-height: 260px; margin: 6px 0; padding: 10px; overflow: auto; border-radius: 4px; background: var(--vscode-editor-background); font-family: var(--vscode-editor-font-family); font-size: 11px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 2; }
     .task-row { display: block; width: 100%; padding: 10px 8px; border: 0; border-bottom: 1px solid var(--vscode-widget-border); text-align: left; color: var(--vscode-foreground); background: transparent; }
-    .task-row:hover { background: var(--vscode-list-hoverBackground); }
+    button.task-row:hover { background: var(--vscode-list-hoverBackground); }
     .task-label { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 600; }
     .task-meta { display: block; margin-top: 4px; color: var(--vscode-descriptionForeground); font-size: 10px; line-height: 1.5; }
     .task-row[data-status="running"] .task-meta { color: var(--vscode-progressBar-background); }
@@ -1834,6 +1834,7 @@ export function chatHtml(webview: vscode.Webview, deepseekMarkUri: vscode.Uri, m
       if (tasksPanel.open) renderTasks();
     }
     function taskStatus(task) {
+      if (task.readState === 'migration-required') return 'Needs migration · Cached state, unverified';
       return ({ running: 'Running', completed: 'Turn completed', interrupted: 'Turn ended without completion', inactive: 'Inactive', unavailable: 'Unavailable' })[task.status] || 'Unknown';
     }
     function renderTasks() {
@@ -1845,9 +1846,11 @@ export function chatHtml(webview: vscode.Webview, deepseekMarkUri: vscode.Uri, m
       const openRecords = new Set([...tasksContent.querySelectorAll('details[open]')].map(item => item.dataset.recordId));
       const scroll = tasksContent.parentElement.scrollTop;
       tasksContent.replaceChildren(); tasksBack.classList.toggle('hidden', !taskChild);
+      if (taskSnapshot && taskSnapshot.readState === 'migration-required') tasksContent.append(node('p', 'inspector-warning', 'This conversation needs migration. Only cached task information is available; current task state and completeness are unverified. Viewing child history here does not migrate the stored session.'));
+      if (taskSnapshot && taskSnapshot.readState === 'missing') tasksContent.append(node('p', 'inspector-warning', 'This conversation is no longer available. Its task catalog could not be read.'));
       if (taskChild) {
-        const task = taskSnapshot && taskSnapshot.tasks.find(item => item.address.childSessionId === taskChild);
-        if (task) tasksContent.append(node('h3', 'task-label', task.label), node('p', 'inspector-caption', taskStatus(task) + ' · ' + task.address.mode));
+        const task = taskSnapshot && taskSnapshot.tasks.find(item => item.id === taskChild);
+        if (task && task.kind === 'local') tasksContent.append(node('h3', 'task-label', task.label), node('p', 'inspector-caption', taskStatus(task) + ' · ' + task.address.mode));
         const detail = taskSnapshot && taskSnapshot.detail;
         if (detail && detail.childSessionId === taskChild) {
           tasksContent.append(node('p', 'inspector-caption', 'Recorded messages and tool results. In-progress text appears after it is recorded by DSH.'));
@@ -1868,12 +1871,17 @@ export function chatHtml(webview: vscode.Webview, deepseekMarkUri: vscode.Uri, m
         const tasks = taskSnapshot ? taskSnapshot.tasks : [];
         if (tasks.length) tasksContent.append(node('div', 'jobs-title', 'Subagents · ' + tasks.length));
         for (const task of tasks) {
-          const row = node('button', 'task-row'); row.type = 'button'; row.dataset.taskId = task.address.childSessionId; row.dataset.status = task.status;
+          const local = task.kind === 'local';
+          const row = node(local ? 'button' : 'div', 'task-row'); row.dataset.taskId = task.id;
           row.style.paddingLeft = (8 + task.depth * 10) + 'px';
-          const seconds = Math.floor(task.elapsedMs / 1000);
-          row.append(node('span', 'task-label', task.label), node('span', 'task-meta', taskStatus(task) + ' · ' + task.address.mode + ' · ' + seconds + 's recorded'));
-          if (task.error) row.append(node('span', 'task-meta', task.error));
-          row.addEventListener('click', () => { taskChild = task.address.childSessionId; taskSnapshot.detail = undefined; renderTasks(); tasksBack.focus(); requestTasks(); });
+          row.append(node('span', 'task-label', task.label));
+          if (local) {
+            row.type = 'button'; row.dataset.status = task.status;
+            const timing = task.readState === 'ready' && typeof task.elapsedMs === 'number' ? ' · ' + Math.floor(task.elapsedMs / 1000) + 's recorded' : '';
+            row.append(node('span', 'task-meta', taskStatus(task) + ' · ' + task.address.mode + timing));
+            if (task.error) row.append(node('span', 'task-meta', task.error));
+            row.addEventListener('click', () => { taskChild = task.id; taskSnapshot.detail = undefined; renderTasks(); tasksBack.focus(); requestTasks(); });
+          } else row.append(node('span', 'task-meta', 'External · No local history' + (task.readState === 'migration-required' ? ' · Cached, unverified' : '')));
           tasksContent.append(row);
         }
         if (taskSnapshot && taskSnapshot.truncated) tasksContent.append(node('p', 'inspector-warning', 'Task tree display limit reached (40 agents / 5 levels).'));
@@ -1883,7 +1891,7 @@ export function chatHtml(webview: vscode.Webview, deepseekMarkUri: vscode.Uri, m
           const row = node('div', 'job-row'); const status = string(job.detail) || string(job.status);
           row.title = status; row.append(node('span', 'job-kind', string(job.kind, 'job')), node('span', 'job-label', string(job.label, 'Background job')), node('span', 'job-detail', status), node('span', 'job-duration', jobDuration(job))); tasksContent.append(row);
         }
-        if (taskSnapshot && !tasks.length && !jobs.length) tasksContent.append(node('p', 'inspector-caption', 'No subagents or background jobs in this conversation.'));
+        if (taskSnapshot && taskSnapshot.readState === 'ready' && !tasks.length && !jobs.length) tasksContent.append(node('p', 'inspector-caption', 'No subagents or background jobs in this conversation.'));
       }
       tasksContent.parentElement.scrollTop = scroll;
       if (focusedId) [...tasksContent.querySelectorAll('button')].find(button => button.dataset.taskId === focusedId)?.focus({ preventScroll: true });

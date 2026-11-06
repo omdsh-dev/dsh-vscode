@@ -156,6 +156,15 @@ describe('task inspection isolation', () => {
     await h.controller.selectSession('b')
     expect(h.controller.state.subagentCount).toBe(0)
   })
+  it('counts external tasks in both the initial snapshot and subsequent projections', async () => {
+    const h = await harness()
+    const external = { id: 'external-run', mode: 'external', label: 'Remote build' }
+    h.client.openSession.mockResolvedValueOnce({ events: [], hasMore: false, projections: { subagentCatalog: [external] }, isCurrent: () => true, activate() {} } as any)
+    await h.controller.selectSession('b')
+    expect(h.controller.state.subagentCount).toBe(1)
+    h.emit({ type: 'session/projection', sessionId: 'b', key: 'subagentCatalog', value: [external, { id: 'local', mode: 'continuable' }] }, 'mux')
+    expect(h.controller.state.subagentCount).toBe(2)
+  })
 })
 
 describe('context inspection', () => {

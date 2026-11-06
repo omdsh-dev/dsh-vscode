@@ -2,16 +2,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { RuntimeChangeController } from '../src/runtime-change.js'
 
 const mocks = vi.hoisted(() => ({
-  input: vi.fn(), warning: vi.fn(), info: vi.fn(), error: vi.fn(), config: vi.fn(), listen: vi.fn(),
+  input: vi.fn(), warning: vi.fn(), pick: vi.fn(), info: vi.fn(), error: vi.fn(), config: vi.fn(), listen: vi.fn(),
 }))
 vi.mock('vscode', () => ({
-  window: { showInputBox: mocks.input, showWarningMessage: mocks.warning, showInformationMessage: mocks.info, showErrorMessage: mocks.error },
+  window: { showInputBox: mocks.input, showWarningMessage: mocks.warning, showQuickPick: mocks.pick, showInformationMessage: mocks.info, showErrorMessage: mocks.error },
   workspace: { getConfiguration: () => ({ get: mocks.config }), onDidChangeConfiguration: mocks.listen },
   Uri: { file: (fsPath: string) => ({ fsPath }) },
 }))
 import { configureApiKey, clearApiKey, watchDebugConfiguration } from '../src/runtime-configuration.js'
 import { restartAfterRuntimeChange, runtimeChangeTarget } from '../src/runtime-change.js'
 import { DEEPSEEK_API_KEY_SECRET } from '../src/credentials.js'
+import { DshCredentials } from '../src/dsh-credentials.js'
+import { DshConnectionError } from '../src/dsh-connection.js'
 
 function harness() {
   const controller = {
@@ -19,6 +21,7 @@ function harness() {
     runtimeOwnership: 'managed' as RuntimeChangeController['runtimeOwnership'],
     hasRunningTasks: false, state: { phase: 'ready' as 'ready' | 'loading' | 'error', statusText: '' },
     restart: vi.fn(async () => true), start: vi.fn(async () => {}),
+    runtimeCredentials: { describe: vi.fn(async (): Promise<any> => undefined), set: vi.fn(async (_value: string) => {}), unset: vi.fn(async () => {}) },
   }
   const secrets = { store: vi.fn(async () => {}), delete: vi.fn(async () => {}) }
   const output = { appendLine: vi.fn() }
@@ -35,7 +38,10 @@ function harness() {
     },
   }
 }
-beforeEach(() => { vi.resetAllMocks(); mocks.input.mockResolvedValue('sk-test'); mocks.warning.mockResolvedValue('Remove') })
+beforeEach(() => {
+  vi.resetAllMocks(); mocks.input.mockResolvedValue('sk-test'); mocks.warning.mockResolvedValue('Remove')
+  mocks.pick.mockImplementation(async (items: any[]) => items.find(item => item.destination === 'legacy'))
+})
 afterEach(() => vi.useRealTimers())
 
 describe('safe automatic runtime restarts', () => {
@@ -75,8 +81,28 @@ describe('credential configuration', () => {
     await h.configure()
     expect(h.secrets.store).toHaveBeenCalledWith(DEEPSEEK_API_KEY_SECRET, 'sk-test')
     expect(h.controller.restart).toHaveBeenCalledTimes(1)
-    expect(mocks.info).toHaveBeenCalledWith('DeepSeek API key configured. DeepSeek Harness restarted.')
+    expect(mocks.info).toHaveBeenCalledWith(expect.stringContaining('environment fallback saved'))
     expect(JSON.stringify(h.output.appendLine.mock.calls)).not.toContain('sk-test')
+  })
+
+  it('uses the legacy fallback for the actual missing-endpoint error', async () => {
+    const h = harness()
+    const call = vi.fn().mockRejectedValue(new DshConnectionError('http-error', 'Not Found', 404))
+    Object.assign(h.controller, { runtimeCredentials: new DshCredentials(call) })
+    await h.configure()
+    expect(call).toHaveBeenCalledExactlyOnceWith('credentials/describe', { refs: ['DEEPSEEK_API_KEY'] })
+    expect(h.secrets.store).toHaveBeenCalledWith(DEEPSEEK_API_KEY_SECRET, 'sk-test')
+    expect(h.controller.restart).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not save a fallback when the Remote exists but argument lookup fails', async () => {
+    const h = harness()
+    const call = vi.fn().mockRejectedValue(new DshConnectionError('gateway/lookup-not-found', 'secret-text'))
+    Object.assign(h.controller, { runtimeCredentials: new DshCredentials(call) })
+    await h.configure()
+    expect(h.secrets.store).not.toHaveBeenCalled(); expect(h.controller.restart).not.toHaveBeenCalled()
+    expect(mocks.input).not.toHaveBeenCalled()
+    expect(mocks.error).toHaveBeenCalledWith(expect.not.stringContaining('secret-text'))
   })
 
   it('does not save or restart after the password dialog is cancelled', async () => {
@@ -108,10 +134,11 @@ describe('credential configuration', () => {
     expect(mocks.warning).toHaveBeenCalledWith(expect.stringContaining('no runtime was restarted'))
   })
 
-  it('does not restart a new runtime selected during the removal confirmation', async () => {
+  it('clears the independent local key but does not restart a runtime replaced during confirmation', async () => {
     const h = harness(); mocks.warning.mockImplementationOnce(async () => { h.controller.runtimeIdentity = {}; return 'Remove' })
     await h.clear()
-    expect(h.secrets.delete).toHaveBeenCalledTimes(1); expect(h.controller.restart).not.toHaveBeenCalled()
+    expect(h.secrets.delete).toHaveBeenCalledWith(DEEPSEEK_API_KEY_SECRET)
+    expect(h.controller.restart).not.toHaveBeenCalled()
   })
 
   it('keeps the external runtime credentials and process untouched', async () => {
@@ -123,11 +150,182 @@ describe('credential configuration', () => {
     expect(mocks.info).toHaveBeenCalledWith(expect.stringContaining('external DSH keeps its own credentials'))
   })
 
-  it('can repair a managed startup failure by storing the key then restarting', async () => {
+  it('does not silently save an ineffective fallback when the runtime cannot connect', async () => {
     const h = harness(); h.controller.runtimeOwnership = undefined; h.controller.runtimeIdentity = undefined; h.controller.state.phase = 'error'
     h.controller.restart.mockImplementation(async () => { h.controller.state.phase = 'ready'; return true })
     await h.configure()
-    expect(h.controller.start).toHaveBeenCalledTimes(1); expect(h.controller.restart).toHaveBeenCalledTimes(1)
+    expect(h.controller.start).toHaveBeenCalledTimes(1); expect(h.controller.restart).not.toHaveBeenCalled()
+    expect(h.secrets.store).not.toHaveBeenCalled()
+    expect(mocks.error).toHaveBeenCalledWith(expect.stringContaining('Connect to a managed'))
+  })
+})
+
+function modernHarness() {
+  const h = harness()
+  const credentials = h.controller.runtimeCredentials
+  credentials.describe.mockResolvedValue({ configured: true, source: 'file', writable: true })
+  mocks.warning.mockImplementation(async (_message: string, _options: unknown, action: string) => action)
+  mocks.pick.mockImplementation(async (items: any[]) => items[0])
+  return { ...h, credentials }
+}
+
+describe('runtime-owned credentials', () => {
+  it('confirms shared storage, writes through DSH and refreshes status without restarting or double-writing', async () => {
+    const h = modernHarness(); mocks.input.mockResolvedValue(' sk-new ')
+    let stored = 'stored-A'
+    const env = 'fallback-B'
+    h.credentials.set.mockImplementation(async value => { stored = value })
+    await h.configure()
+    expect(stored || env).toBe('sk-new')
+    expect(h.credentials.set).toHaveBeenCalledWith('sk-new')
+    expect(h.credentials.describe).toHaveBeenCalledTimes(2)
+    expect(mocks.warning).toHaveBeenCalledWith(expect.stringContaining('shared by clients'), { modal: true }, 'Save to DSH')
+    expect(h.secrets.store).not.toHaveBeenCalled(); expect(h.secrets.delete).not.toHaveBeenCalled()
+    expect(h.controller.restart).not.toHaveBeenCalled()
+    expect(mocks.info).toHaveBeenCalledWith(expect.stringContaining('has not been tested'))
+    expect(JSON.stringify([h.output.appendLine.mock.calls, mocks.info.mock.calls])).not.toContain('sk-new')
+  })
+
+  it.each(['confirmation', 'input', 'read-only', 'unconfigured-read-only', 'loading', 'describe-failure'])(
+    'does not save for %s', async reason => {
+      const h = modernHarness()
+      if (reason === 'confirmation') mocks.warning.mockResolvedValue(undefined)
+      if (reason === 'input') mocks.input.mockResolvedValue(undefined)
+      if (reason.endsWith('read-only')) h.credentials.describe.mockResolvedValue({ configured: reason === 'read-only', writable: false })
+      if (reason === 'loading') h.controller.state.phase = 'loading'
+      if (reason === 'describe-failure') h.credentials.describe.mockRejectedValue(new Error('Could not read credential configuration'))
+      await h.configure()
+      expect(h.credentials.set).not.toHaveBeenCalled(); expect(h.secrets.store).not.toHaveBeenCalled()
+      expect(h.controller.restart).not.toHaveBeenCalled(); expect(mocks.info).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each(['describe', 'confirmation', 'input'])( 'abandons a replaced runtime after %s', async stage => {
+    const h = modernHarness()
+    if (stage === 'describe') h.credentials.describe.mockImplementationOnce(async () => { h.controller.runtimeIdentity = {}; return { configured: true, writable: true } })
+    if (stage === 'confirmation') mocks.warning.mockImplementationOnce(async () => { h.controller.runtimeIdentity = {}; return 'Save to DSH' })
+    if (stage === 'input') mocks.input.mockImplementationOnce(async () => { h.controller.runtimeIdentity = {}; return 'sk-new' })
+    await h.configure()
+    expect(h.credentials.set).not.toHaveBeenCalled(); expect(h.secrets.store).not.toHaveBeenCalled()
+    expect(mocks.info).not.toHaveBeenCalled()
+  })
+
+  it('does not replay a write or report success when the client is replaced during set', async () => {
+    const h = modernHarness(), original = h.credentials
+    original.set.mockImplementationOnce(async () => { h.controller.runtimeCredentials = modernHarness().credentials })
+    await h.configure()
+    expect(original.describe).toHaveBeenCalledTimes(1)
+    expect(h.controller.runtimeCredentials.set).not.toHaveBeenCalled()
+    expect(mocks.info).not.toHaveBeenCalled()
+    expect(mocks.warning).toHaveBeenLastCalledWith(expect.stringContaining('after the credential request was sent'))
+  })
+
+  it.each(['write-error', 'verification-error', 'verification-empty'])('does not store a fallback or report success after %s', async reason => {
+    const h = modernHarness()
+    if (reason === 'write-error') h.credentials.set.mockRejectedValue(new Error('Write result unconfirmed'))
+    if (reason === 'verification-error') h.credentials.describe.mockResolvedValueOnce({ configured: true, writable: true }).mockRejectedValueOnce(new Error('offline'))
+    if (reason === 'verification-empty') h.credentials.describe.mockResolvedValueOnce({ configured: true, writable: true }).mockResolvedValueOnce({ configured: false, writable: true })
+    await h.configure()
+    expect(h.secrets.store).not.toHaveBeenCalled(); expect(h.controller.restart).not.toHaveBeenCalled()
+    expect(mocks.info).not.toHaveBeenCalled(); expect(mocks.error).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not interrupt running tasks to apply a runtime-owned key', async () => {
+    const h = modernHarness(); h.controller.hasRunningTasks = true
+    await h.configure()
+    expect(h.credentials.set).toHaveBeenCalledTimes(1); expect(h.controller.restart).not.toHaveBeenCalled()
+  })
+
+  it('does not open concurrent configure/clear dialogs', async () => {
+    const h = modernHarness(), input = Promise.withResolvers<string | undefined>()
+    mocks.input.mockReturnValueOnce(input.promise)
+    const pending = h.configure()
+    await vi.waitFor(() => expect(mocks.input).toHaveBeenCalled())
+    await h.clear(); await h.configure()
+    expect(mocks.input).toHaveBeenCalledTimes(1); expect(mocks.pick).not.toHaveBeenCalled()
+    input.resolve(undefined); await pending
+    mocks.input.mockResolvedValue('sk-next'); await h.configure()
+    expect(h.credentials.set).toHaveBeenCalledWith('sk-next')
+  })
+
+  it('requires explicit removal from the shared store and reports surviving fallback credentials', async () => {
+    const h = modernHarness()
+    h.credentials.describe.mockResolvedValueOnce({ configured: true, writable: true, source: 'file' })
+      .mockResolvedValueOnce({ configured: true, writable: true, source: 'env' })
+    await h.clear()
+    expect(h.credentials.unset).toHaveBeenCalledTimes(1)
+    expect(mocks.warning).toHaveBeenCalledWith(expect.stringContaining('shared credential store'), { modal: true }, 'Remove from DSH')
+    expect(mocks.info).toHaveBeenCalledWith(expect.stringContaining('credential is still configured'))
+    expect(h.secrets.delete).not.toHaveBeenCalled(); expect(h.controller.restart).not.toHaveBeenCalled()
+  })
+
+  it('clears only the selected legacy fallback without modifying DSH storage', async () => {
+    const h = modernHarness(); mocks.pick.mockImplementation(async (items: any[]) => items[1])
+    await h.clear()
+    expect(h.secrets.delete).toHaveBeenCalledWith(DEEPSEEK_API_KEY_SECRET)
+    expect(h.credentials.unset).not.toHaveBeenCalled(); expect(h.controller.restart).toHaveBeenCalledTimes(1)
+    expect(h.credentials.describe).not.toHaveBeenCalled()
+  })
+
+  it.each(['disconnected', 'loading', 'describe-failure', 'client-replaced'])(
+    'allows independent local-key deletion when %s without accessing the shared store', async reason => {
+      const h = modernHarness()
+      h.credentials.describe.mockRejectedValue(new Error('secret-text'))
+      if (reason === 'disconnected' || reason === 'loading') {
+        Object.assign(h.controller, { runtimeCredentials: undefined })
+        h.controller.state.phase = reason === 'loading' ? 'loading' : 'error'
+      }
+      mocks.pick.mockImplementationOnce(async (items: any[]) => {
+        const local = items.find(item => item.destination === 'legacy')
+        expect(local).toBeDefined()
+        if (reason === 'disconnected' || reason === 'loading') expect(items).toHaveLength(1)
+        if (reason === 'client-replaced') Object.assign(h.controller, { runtimeCredentials: undefined })
+        return local
+      })
+      await h.clear()
+      expect(h.secrets.delete).toHaveBeenCalledWith(DEEPSEEK_API_KEY_SECRET)
+      expect(h.credentials.describe).not.toHaveBeenCalled(); expect(h.credentials.unset).not.toHaveBeenCalled()
+      expect(h.controller.start).not.toHaveBeenCalled()
+      expect(mocks.error).not.toHaveBeenCalled()
+      if (reason !== 'describe-failure') expect(h.controller.restart).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each(['missing-api', 'read-only', 'describe-failure'])(
+    'does not switch to local deletion when shared-store removal fails with %s', async reason => {
+      const h = modernHarness()
+      if (reason === 'missing-api') h.credentials.describe.mockResolvedValue(undefined)
+      if (reason === 'read-only') h.credentials.describe.mockResolvedValue({ configured: true, writable: false })
+      if (reason === 'describe-failure') h.credentials.describe.mockRejectedValue(new Error('Could not read DSH credentials'))
+      await h.clear()
+      expect(h.credentials.unset).not.toHaveBeenCalled(); expect(h.secrets.delete).not.toHaveBeenCalled()
+      expect(h.controller.restart).not.toHaveBeenCalled(); expect(mocks.error).toHaveBeenCalledTimes(1)
+      // Retrying with the independent local option must still work.
+      mocks.pick.mockImplementationOnce(async (items: any[]) => items.find(item => item.destination === 'legacy'))
+      await h.clear()
+      expect(h.secrets.delete).toHaveBeenCalledWith(DEEPSEEK_API_KEY_SECRET)
+      expect(h.credentials.describe).toHaveBeenCalledTimes(1)
+    },
+  )
+
+  it.each(['picker', 'confirmation', 'disposed'])(
+    'does not delete the disconnected local fallback after %s cancellation', async stage => {
+      const h = modernHarness(); Object.assign(h.controller, { runtimeCredentials: undefined })
+      h.controller.state.phase = 'error'
+      if (stage === 'picker') mocks.pick.mockResolvedValue(undefined)
+      if (stage === 'confirmation') mocks.warning.mockResolvedValue(undefined)
+      if (stage === 'disposed') mocks.warning.mockImplementationOnce(async () => { h.controller.isDisposed = true; return 'Remove' })
+      await h.clear()
+      expect(h.secrets.delete).not.toHaveBeenCalled(); expect(h.controller.restart).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each(['picker', 'confirmation'])('does not remove from a new runtime selected during %s', async stage => {
+    const h = modernHarness()
+    if (stage === 'picker') mocks.pick.mockImplementationOnce(async (items: any[]) => { h.controller.runtimeIdentity = {}; return items[0] })
+    else mocks.warning.mockImplementationOnce(async () => { h.controller.runtimeIdentity = {}; return 'Remove from DSH' })
+    await h.clear()
+    expect(h.credentials.unset).not.toHaveBeenCalled(); expect(h.secrets.delete).not.toHaveBeenCalled()
   })
 })
 

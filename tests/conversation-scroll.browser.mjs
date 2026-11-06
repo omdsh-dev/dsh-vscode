@@ -733,9 +733,9 @@ try {
     showState({...baseline,subagentCount:2,jobs:[{id:'job',kind:'shell',label:'Development server',status:'running',startedAt:Date.now()}]}); await tick();
     elements.prompt.value='Keep this draft'; elements.jobsTrigger.click();
     ensure(tasksPanel.open, 'tasks did not open');
-    window.taskFixture={sessionId:state.sessionId,truncated:false,tasks:[
-      {address:{kind:'subagent',parentSessionId:state.sessionId,childSessionId:'child-a',mode:'continuable'},label:'Inspect API error handling',depth:0,status:'running',elapsedMs:1200},
-      {address:{kind:'subagent',parentSessionId:'child-a',childSessionId:'child-b',mode:'one-shot'},label:'Review authentication edge cases',depth:1,status:'completed',elapsedMs:3450}
+    window.taskFixture={sessionId:state.sessionId,readState:'ready',truncated:false,tasks:[
+      {kind:'local',id:'child-a',readState:'ready',address:{kind:'subagent',parentSessionId:state.sessionId,childSessionId:'child-a',mode:'continuable'},label:'Inspect API error handling',depth:0,status:'running',elapsedMs:1200},
+      {kind:'local',id:'child-b',readState:'ready',address:{kind:'subagent',parentSessionId:'child-a',childSessionId:'child-b',mode:'one-shot'},label:'Review authentication edge cases',depth:1,status:'completed',elapsedMs:3450}
     ]};
     window.taskReply=(request,extra={})=>window.dispatchEvent(new MessageEvent('message',{data:{type:'task-inspection',sessionId:request.sessionId,requestId:request.requestId,inspection:taskFixture,...extra}}));
     const request=sent.findLast(message=>message.type==='inspect-tasks');
@@ -782,6 +782,21 @@ try {
     ensure(elements.prompt.value==='Keep this draft' && state.sessionId===taskSession, 'inspection changed parent draft/session');
     tasksBack.click(); taskReply(sent.findLast(message=>message.type==='inspect-tasks'));
     ensure(!taskChild && tasksContent.querySelectorAll('.task-row').length===2, 'back navigation failed');
+    requestTasks();
+    taskReply(sent.findLast(message=>message.type==='inspect-tasks'),{inspection:{...taskFixture,readState:'migration-required',tasks:[
+      {...taskFixture.tasks[0],readState:'migration-required',status:'unknown',elapsedMs:undefined},
+      {kind:'external',id:'external',label:'External worker',depth:0,readState:'migration-required'}
+    ]}});
+    ensure(tasksContent.textContent.includes('Needs migration') && tasksContent.textContent.includes('Cached, unverified'), 'cached tasks appear current');
+    ensure(!tasksContent.textContent.includes('s recorded') && !tasksContent.textContent.includes('Turn completed'), 'cached tasks show progress');
+    const external=tasksContent.querySelector('[data-task-id="external"]');
+    ensure(external && external.tagName==='DIV' && !external.querySelector('button, a'), 'external task has a local history action');
+    const sentBefore=sent.length; external.click(); ensure(sent.length===sentBefore && !taskChild, 'external task requested local history');
+    ensure(tasksPanel.scrollWidth<=tasksPanel.clientWidth, 'cached task captions overflow narrow sidebar');
+    showState({...state,jobs:[]}); await tick(); requestTasks();
+    taskReply(sent.findLast(message=>message.type==='inspect-tasks'),{inspection:{...taskFixture,readState:'missing',tasks:[]}});
+    ensure(tasksContent.textContent.includes('no longer available') && !tasksContent.textContent.includes('No subagents'), 'missing catalog appears empty');
+    requestTasks(); taskReply(sent.findLast(message=>message.type==='inspect-tasks'));
   })()`)
   await page('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 })
   await page('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 })

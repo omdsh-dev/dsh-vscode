@@ -7,15 +7,14 @@ import { readSubagentTasks, subagentDetail, type TaskInspection, type SubagentAd
 export async function inspectSubagents(connection: DshConnection, sessionId: string, childId: string | undefined,
   running: (id: string) => boolean | undefined, signal: AbortSignal): Promise<TaskInspection> {
   const inspection = await readSubagentTasks(sessionId, async id => {
-    const value = await connection.call<unknown>('session/projections', { request: { sessionId: id } }, 10_000, signal)
-    if (value === null) return null
-    if (!wireRecord(value) || !wireRecord(value.values)) throw new Error('Invalid DSH task projections.')
-    return value.values
+    return connection.call<unknown>('session/projections', { request: { sessionId: id } }, 10_000, signal)
   }, running, signal)
   signal.throwIfAborted()
   if (childId !== undefined) {
-    const child = inspection.tasks.find(task => task.address.childSessionId === childId)
+    const child = inspection.tasks.find(task => task.id === childId)
+    if (inspection.readState === 'missing') throw new Error('This conversation is no longer available.')
     if (child === undefined) throw new Error('This agent is not in the current conversation’s task catalog.')
+    if (child.kind === 'external') throw new Error('This external task has no local session history.')
     inspection.detail = await readChildSnapshot(connection, child.address, signal)
   }
   return inspection
